@@ -338,7 +338,7 @@ Flow: the provider installs an uncaught-exception handler, preserving any previo
 
 ## Contributing
 
-Development setup, build verification, review process, and code conventions: [CONTRIBUTING](CONTRIBUTING.md). Pull requests get an automated CodeRabbit review on open and on each new push; a human maintainer closes the merge. Security issues go by email to `contact@crashx.dev` rather than the public tracker.
+Development setup, build verification, review process, and code conventions: [CONTRIBUTING](CONTRIBUTING.md). Pull requests get an automated CodeRabbit review on open and on each new push; a human maintainer closes the merge. Security issues go by email to `contact.devsoufiano@gmail.com` rather than the public tracker.
 
 ## Attribution
 
