@@ -57,8 +57,6 @@ android {
 }
 
 dependencies {
-	implementation fileTree(include: ['*.jar'], dir: 'libs')
-
     //ANDROIDX JETPACK LIBRARIES
     implementation 'androidx.appcompat:appcompat:1.7.1'
     implementation 'androidx.cardview:cardview:1.0.0'
