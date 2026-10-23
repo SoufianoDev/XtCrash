@@ -32,11 +32,9 @@ android {
 }
 
 dependencies {
-	implementation fileTree(include: ['*.jar'], dir: 'libs')
-
     //ANDROIDX JETPACK LIBRARIES
     implementation 'androidx.appcompat:appcompat:1.7.1'
-	
-	//CrashX library
+
+    // XtCrash core library
     implementation project(":library")
 }
