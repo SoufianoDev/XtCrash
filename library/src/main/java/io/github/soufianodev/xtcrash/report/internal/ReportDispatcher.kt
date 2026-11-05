@@ -113,6 +113,13 @@ class ReportDispatcher(
     @Volatile
     private var currentRequestId: String? = null
 
+    /**
+     * Request whose first privacy confirmation must precede handler invocation.
+     * Cleared when that confirmation is consumed, so explicit fallback actions
+     * cannot accidentally invoke the handler a second time.
+     */
+    private val handlerConfirmation = ReportHandlerConfirmationState()
+
     fun setListener(listener: Listener?) {
         this.listener = listener
     }
@@ -127,6 +134,7 @@ class ReportDispatcher(
         if (!ownership.tryBegin()) {
             return
         }
+        handlerConfirmation.clear()
         val requestId = UUID.randomUUID().toString()
         ownership.beginRequest(requestId)
         currentRequestId = requestId
@@ -139,6 +147,7 @@ class ReportDispatcher(
      * tap can start a new request.
      */
     fun cancelPending() {
+        handlerConfirmation.clear()
         ownership.releaseInFlight()
         ownership.clearConfirmation()
     }
@@ -151,6 +160,7 @@ class ReportDispatcher(
      * that an external handler's acceptance was cancelled or rolled back.
      */
     fun invalidate() {
+        handlerConfirmation.clear()
         currentRequestId = null
         currentPrepared = null
         ownership.invalidate()
@@ -181,7 +191,25 @@ class ReportDispatcher(
     fun confirmWebUrl() {
         val requestId = currentRequestId ?: return
         val prepared = ownership.consumeConfirmation(requestId) ?: return
-        openUrl(requestId, prepared)
+        val shouldInvokeHandler = handlerConfirmation.consumeFor(requestId)
+        // Copy only after the user confirms the privacy disclosure.
+        if (prepared.prefillOmitsReport && !prepared.reportCopiedToClipboard) {
+            prepared.reportCopiedToClipboard = copyToClipboard(canonicalReport)
+        }
+        if (shouldInvokeHandler) {
+            val handlerClass = config.reportActionHandlerClass
+            if (handlerClass != null) {
+                // The user has reviewed the exact report-bearing URL. Only now
+                // may the integration receive it and decide whether to accept.
+                invokeHandler(requestId, handlerClass, prepared, webConfirmed = true)
+            } else {
+                openUrl(requestId, prepared)
+            }
+        } else {
+            // Explicit fallback confirmation must open the URL, not retry the
+            // handler that already failed or returned an uncertain outcome.
+            openUrl(requestId, prepared)
+        }
     }
 
     private fun emit(requestId: String, state: ReportState) {
@@ -228,7 +256,19 @@ class ReportDispatcher(
         // 8. Invoke the optional report-action handler when configured.
         val handlerClass = config.reportActionHandlerClass
         if (handlerClass != null) {
-            invokeHandler(requestId, handlerClass, prepared)
+            if (ReportHandlerConsentPolicy.requiresConsentBeforeHandler(
+                    prepared.destination,
+                    handlerConfigured = true,
+                )
+            ) {
+                // Web destinations carry report content in the URL. Do not
+                // pass that URL to an external integration before the user
+                // has reviewed the privacy confirmation.
+                handlerConfirmation.stage(requestId)
+                performWebAction(requestId, prepared)
+            } else {
+                invokeHandler(requestId, handlerClass, prepared)
+            }
             return
         }
 
@@ -326,7 +366,12 @@ class ReportDispatcher(
         prefillBody = built.body
     }
 
-    private fun invokeHandler(requestId: String, handlerClass: Class<out ReportActionHandler>, prepared: PreparedReport) {
+    private fun invokeHandler(
+        requestId: String,
+        handlerClass: Class<out ReportActionHandler>,
+        prepared: PreparedReport,
+        webConfirmed: Boolean = false,
+    ) {
         emit(requestId, ReportState(Phase.HANDLER_RUNNING, prepared = prepared))
         val timeoutMs = config.reportHandlerTimeoutMs.toLong()
 
@@ -339,7 +384,7 @@ class ReportDispatcher(
                     // crash or a replaced dispatcher.
                     return@post
                 }
-                handleOutcome(requestId, result, prepared)
+                handleOutcome(requestId, result, prepared, webConfirmed)
             }
         }.start()
     }
@@ -393,13 +438,18 @@ class ReportDispatcher(
      * of responsibility — never a submitted issue or sent email — and never
      * starts another flow. UNKNOWN never triggers an automatic retry.
      */
-    private fun handleOutcome(requestId: String, outcome: ReportOutcome, prepared: PreparedReport) {
+    private fun handleOutcome(
+        requestId: String,
+        outcome: ReportOutcome,
+        prepared: PreparedReport,
+        webConfirmed: Boolean,
+    ) {
         when (outcome) {
             ReportOutcome.ACCEPTED -> {
                 emit(requestId, ReportState(Phase.ACCEPTED, message = context.getString(R.string.xtcrash_report_accepted), prepared = prepared))
             }
             ReportOutcome.NOT_HANDLED -> {
-                performDestinationAction(requestId, prepared)
+                performDestinationAction(requestId, prepared, webConfirmed)
             }
             ReportOutcome.FAILED -> {
                 emit(requestId, ReportState(
@@ -421,11 +471,18 @@ class ReportDispatcher(
     }
 
     /** Normal action for the selected destination. Also the fallback executor. */
-    private fun performDestinationAction(requestId: String, prepared: PreparedReport) {
+    private fun performDestinationAction(
+        requestId: String,
+        prepared: PreparedReport,
+        webConfirmed: Boolean = false,
+    ) {
         when (prepared.destination) {
             null -> performSharesheetAction(requestId, prepared)
             ReportDestination.EMAIL -> performEmailAction(requestId, prepared)
-            ReportDestination.GITHUB, ReportDestination.GITLAB -> performWebAction(requestId, prepared)
+            ReportDestination.GITHUB, ReportDestination.GITLAB -> {
+                if (webConfirmed) openUrl(requestId, prepared)
+                else performWebAction(requestId, prepared)
+            }
             ReportDestination.CUSTOM -> performCustomAction(requestId, prepared)
         }
     }
@@ -490,13 +547,14 @@ class ReportDispatcher(
     }
 
     /**
-     * Web destinations: prepare the URL, copy the full report when the prefill
-     * had to be shortened, then wait for the privacy confirmation that must
-     * appear before any report-bearing URL is opened.
+     * Web destinations: stage the privacy confirmation for a prepared web URL
+     * without writing to the clipboard. Confirmation must precede copying and
+     * opening any report-bearing URL.
      */
     private fun performWebAction(requestId: String, prepared: PreparedReport) {
         val url = prepared.url
         if (url == null) {
+            handlerConfirmation.clearIf(requestId)
             emit(requestId, ReportState(
                 Phase.CONFIG_INVALID,
                 message = context.getString(R.string.xtcrash_report_config_invalid),
@@ -506,15 +564,12 @@ class ReportDispatcher(
             return
         }
 
-        if (prepared.prefillOmitsReport) {
-            // The shortened prefill cannot claim to hold the whole report, so
-            // offer the complete canonical text on the clipboard.
-            prepared.reportCopiedToClipboard = copyToClipboard(canonicalReport)
-        }
-
         emit(requestId, ReportState(
             Phase.WAITING_USER_ACTION,
-            message = privacyDialogMessage(prepared),
+            message = privacyDialogMessage(
+                prepared,
+                handlerConfirmationStaged = handlerConfirmation.isStagedFor(requestId),
+            ),
             fallbackAvailable = true,
             prepared = prepared,
         ))
@@ -562,7 +617,10 @@ class ReportDispatcher(
      * opened. Built here once so the XML and Compose screens cannot drift; it
      * only claims a clipboard copy when one actually succeeded.
      */
-    private fun privacyDialogMessage(prepared: PreparedReport): String {
+    private fun privacyDialogMessage(
+        prepared: PreparedReport,
+        handlerConfirmationStaged: Boolean,
+    ): String {
         val url = prepared.url
             ?: return context.getString(R.string.xtcrash_report_url_privacy_invalid_url)
         val destination = prepared.destination
@@ -611,16 +669,24 @@ class ReportDispatcher(
             ),
             destination = destinationDetails,
             fields = fieldDetails,
+            handlerDisclosure = if (handlerConfirmationStaged) {
+                // Staged only when a consent-gated handler will receive the
+                // unshortened report; the user must see that before
+                // confirming. Fallback dialogs (already consumed) omit it.
+                context.getString(R.string.crash_report_url_privacy_handler)
+            } else {
+                null
+            },
         )
         val manualPasteNote = ReportPrivacyPolicy.manualPasteNote(
             prefillOmitsReport = prepared.prefillOmitsReport,
             reportCopiedToClipboard = prepared.reportCopiedToClipboard,
             manualPasteNote = context.getString(R.string.xtcrash_report_manual_paste),
-            manualPasteNotCopiedNote = context.getString(R.string.xtcrash_report_manual_paste_not_copied),
+            manualPasteNotCopiedNote = context.getString(R.string.xtcrash_report_manual_paste_pending),
         )
 
-        // Keep the legacy resource so apps that customize it retain localization.
-        // If a customized resource omits %2$s, still show the privacy details.
+        // Reads the legacy-named key so documented app overrides of this
+        // dialog text keep applying (see the strings.xml lint exception).
         val formattedMessage = context.getString(
             R.string.xtcrash_report_url_privacy_message,
             destinationLabel,
@@ -700,7 +766,7 @@ class ReportDispatcher(
                 if (!ownership.owns(requestId)) {
                     return@post
                 }
-                handleOutcome(requestId, outcome, prepared)
+                handleOutcome(requestId, outcome, prepared, webConfirmed = false)
             }
         }.start()
     }

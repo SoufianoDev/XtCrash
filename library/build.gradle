@@ -39,6 +39,8 @@ android {
     }
     buildTypes {
         release {
+            // Android library shrinking is performed by the consuming application.
+            // Keep the published AAR's public API intact for consumer-side R8.
             minifyEnabled false
             consumerProguardFiles 'consumer-rules.pro'
         }
@@ -56,7 +58,8 @@ android {
         targetCompatibility JavaVersion.VERSION_11
     }
     lint {
-        abortOnError false
+        // CI lint gate only; local and consumer builds keep the non-aborting default.
+        abortOnError providers.gradleProperty('lint.abortOnError').orElse('false').get().toBoolean()
     }
 }
 
